@@ -67,6 +67,7 @@ You can open a listening port 8081 and that port will be hidden for `ss`. `netst
 
 ### Reverse Shell via ICMP Trigger
 
+NOTE: However its possible to hide/use IPv6, it not tested, so its generally not recommended to use IPv6
 Singularity includes a hidden reverse shell activated by a magic ICMP packet sent from the attacker's machine.
 
 1. Configure Target for Reverse Shell
@@ -105,6 +106,10 @@ The rootkit will capture the ICMP packet, trigger the spawn_revshell work, and a
 Join in **Rootkit Researchers** a community where there are only wizards and people who like rootkits, malware, red teaming, forensics and cyber security in general.
 
 - https://discord.gg/66N5ZQppU7
+
+Some Code is Taken from
+
+- https://github.com/iurjscsi1101500/fuxSocy/tree/main
 
 There are codes that I originally reused from my "Collection of codes focused on Linux rootkits" repository, so 
 **credits to the repo contributors as well.**
