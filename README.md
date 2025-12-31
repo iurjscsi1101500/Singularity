@@ -6,7 +6,7 @@
 
 **Singularity** is a powerful Linux Kernel Module (LKM) rootkit designed for modern 6.x kernels. It provides comprehensive stealth capabilities through advanced system call hooking via ftrace infrastructure.
 
-**Full Research Article**: [Singularity: A Final Boss Linux Kernel Rootkit](https://blog.kyntra.io/Singularity-A-final-boss-linux-kernel-rootkit)
+**Full Research Article (outdated version)**: [Singularity: A Final Boss Linux Kernel Rootkit](https://blog.kyntra.io/Singularity-A-final-boss-linux-kernel-rootkit)
 
 **EDR Evasion Case Study**: [Bypassing Elastic EDR with Singularity](https://matheuzsecurity.github.io/hacking/bypassing-elastic/)
 
