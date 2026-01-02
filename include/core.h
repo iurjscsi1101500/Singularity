@@ -51,4 +51,7 @@
 #include <net/net_namespace.h>
 #include <linux/syslog.h>
 #include <linux/vmalloc.h>
+#include <linux/genetlink.h>
+#include <net/genetlink.h>
+#include <linux/taskstats.h>
 #endif

