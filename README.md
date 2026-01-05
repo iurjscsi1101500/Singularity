@@ -1,4 +1,4 @@
-# Singularity - Stealthy Linux Kernel Rootkit
+# Singularity - POC of Stealthy Linux Kernel Rootkit
 
 <img src="https://i.imgur.com/n3U5fsP.jpeg" alt="Singularity Rootkit" width="600"/>
 
