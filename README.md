@@ -628,6 +628,7 @@ I won't patch for this, because it will be much more OP ;)
 ### Code References
 
 - [fuxSocy](https://github.com/iurjscsi1101500/fuxSocy/tree/main)
+- [Adrishya](https://github.com/malefax/Adrishya/blob/main/Adrishya.c#L158)
 - [MatheuZSecurity/Rootkit](https://github.com/MatheuZSecurity/Rootkit)
 
 ### Research Inspiration
@@ -635,7 +636,6 @@ I won't patch for this, because it will be much more OP ;)
 - [KoviD](https://github.com/carloslack/KoviD)
 - [Basilisk](https://github.com/lil-skelly/basilisk)
 - [GOAT Diamorphine rootkit](https://github.com/m0nad/Diamorphine)
-- [Adrishya](https://github.com/malefax/Adrishya/blob/main/Adrishya.c#L158)
 
 ---
 
