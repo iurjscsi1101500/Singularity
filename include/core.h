@@ -54,4 +54,10 @@
 #include <linux/genetlink.h>
 #include <net/genetlink.h>
 #include <linux/taskstats.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_conntrack.h>
+#include <linux/sock_diag.h>
+#include <linux/inet_diag.h>
+#include <net/tcp.h>
+#include <net/udp.h>
 #endif

