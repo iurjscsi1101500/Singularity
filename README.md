@@ -369,15 +369,17 @@ Child processes automatically tracked via sched_process_fork tracepoint hook.
 
 ---
 
-## Compatibility
+## Tested Kernel Versions
 
-**Tested on**: Kernel 6.8.0-79-generic ✅ | Kernel 6.12 ✅ | Kernel 6.17.8-300.fc43 ✅
+To do this, I performed different tests on different versions of the 6x kernel and OS.
 
-**Architecture**: x86_64 (primary) | ia32 (full support)
-
-**May not work on**: Kernels < 6.x | Kernels without ftrace support
-
-**Always test in a VM first**
+| Kernel Version | Distribution | Status | Notes |
+|---------------|--------------|--------|-------|
+| 6.8.0-79-generic | Ubuntu 22.04 / 24.04 | ✅ Stable | Primary development environment |
+| 6.12.0-174.el10.x86_64 | CentOS Stream 10 | ✅ Stable | RHEL-based kernel |
+| 6.12.48+deb13-amd64 | Debian 13 (Trixie) | ✅ Stable | Debian kernel |
+| 6.17.8-300.fc43.x86_64 | Fedora 43 | ✅ Stable | SELinux enforcing bypass validated |
+| 6.17.0-8-generic | Ubuntu 25.10 | ✅ Stable | Newer generic kernel, fully functional |
 
 ---
 
